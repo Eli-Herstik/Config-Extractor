@@ -11,7 +11,7 @@ import json
 import re
 import sys
 from dataclasses import dataclass, field
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from playwright.async_api import async_playwright, Response, Page
 
@@ -310,20 +310,44 @@ def print_results(sources: list[ConfigSource]) -> None:
         for u in src.urls_found:
             print(f"    {u}")
             all_urls.add(u)
+    hosts: set[str] = set()
+    for u in all_urls:
+        host = urlparse(u).hostname
+        if host:
+            hosts.add(host)
+    sorted_hosts = sorted(hosts)
+
     print(f"\n{'=' * 70}")
     print(f"Total config sources: {len(sources)}")
     print(f"Total unique URLs:    {len(all_urls)}")
+    if sorted_hosts:
+        print(f"\nUnique hosts ({len(sorted_hosts)}):")
+        for h in sorted_hosts:
+            print(f"    {h}")
     print(f"{'=' * 70}\n")
 
 
 def write_results(sources: list[ConfigSource], path: str) -> None:
-    output = []
+    all_urls: set[str] = set()
+    entries = []
     for src in sources:
-        output.append({
+        entries.append({
             "source": src.origin,
             "urls": src.urls_found,
             "error": src.error,
         })
+        all_urls.update(src.urls_found)
+
+    hosts: set[str] = set()
+    for u in all_urls:
+        host = urlparse(u).hostname
+        if host:
+            hosts.add(host)
+
+    output = {
+        "sources": entries,
+        "unique_hosts": sorted(hosts),
+    }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
     print(f"Results written to {path}")
