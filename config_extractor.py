@@ -13,6 +13,8 @@ import sys
 from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlparse
 
+import aiohttp
+
 from playwright.async_api import async_playwright, Response, Page
 
 MAX_PAYLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
@@ -25,6 +27,333 @@ class ConfigSource:
     json_payload: object = None
     urls_found: list[str] = field(default_factory=list)
     error: str | None = None
+
+
+@dataclass
+class AuthHint:
+    """Auth evidence from static analysis of config JSON context."""
+    method: str          # "api_key" | "bearer" | "oauth" | "basic" | "cookie_session" | "custom_header"
+    confidence: str      # "high" | "medium" | "low"
+    evidence_key: str    # the JSON key that triggered detection
+    evidence_value: str  # redacted value
+    source: str          # which ConfigSource.origin it came from
+
+
+@dataclass
+class ProbeResult:
+    """Auth evidence from HTTP probing."""
+    url: str
+    status_code: int | None
+    www_authenticate: str | None
+    detected_method: str | None  # "basic" | "bearer" | "negotiate" | "none" | "unknown" | "forbidden"
+    error: str | None = None
+
+
+@dataclass
+class AuthInfo:
+    """Combined auth info for a single URL."""
+    url: str
+    static_hints: list[AuthHint] = field(default_factory=list)
+    probe_result: ProbeResult | None = None
+    best_guess: str = "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Auth key patterns for static analysis
+# ---------------------------------------------------------------------------
+
+AUTH_KEY_PATTERNS: dict[str, list[re.Pattern]] = {
+    "api_key": [re.compile(r"^(api[_-]?key|secret[_-]?key|api[_-]?secret|x[_-]api[_-]key)$", re.I)],
+    "bearer": [re.compile(r"^(bearer[_-]?token|access[_-]?token|auth[_-]?token|token)$", re.I)],
+    "oauth": [re.compile(r"^(oauth|client[_-]?id|client[_-]?secret|grant[_-]?type|redirect[_-]?uri)$", re.I)],
+    "basic": [re.compile(r"^(username|password|user|passwd)$", re.I)],
+    "cookie_session": [re.compile(r"^(cookie|session[_-]?id|session[_-]?token|csrf[_-]?token)$", re.I)],
+    "custom_header": [re.compile(r"^(authorization|x-api-key|x-auth-token)$", re.I)],
+}
+
+
+def _redact_value(value: str) -> str:
+    """Redact a credential value, showing only the first 4 characters."""
+    if not isinstance(value, str) or len(value) < 4:
+        return "[present]"
+    return value[:4] + "***"
+
+
+def _match_auth_key(key: str) -> str | None:
+    """Return the auth method name if key matches any AUTH_KEY_PATTERNS, else None."""
+    for method, patterns in AUTH_KEY_PATTERNS.items():
+        for pat in patterns:
+            if pat.match(key):
+                return method
+    return None
+
+
+def find_auth_context(obj, source_origin: str) -> list[AuthHint]:
+    """Walk parsed JSON and find auth-related keys that are siblings of URL values."""
+    hints: list[AuthHint] = []
+
+    if not isinstance(obj, dict):
+        if isinstance(obj, list):
+            for item in obj:
+                hints.extend(find_auth_context(item, source_origin))
+        return hints
+
+    # Check if this dict contains any URL values
+    has_url = False
+    for v in obj.values():
+        if isinstance(v, str) and URL_RE.search(v):
+            has_url = True
+            break
+
+    # Check sibling keys for auth patterns
+    if has_url:
+        for key, value in obj.items():
+            method = _match_auth_key(key)
+            if method:
+                val_str = str(value) if not isinstance(value, str) else value
+                hints.append(AuthHint(
+                    method=method,
+                    confidence="high",
+                    evidence_key=key,
+                    evidence_value=_redact_value(val_str),
+                    source=source_origin,
+                ))
+
+    # Check child dicts for auth keys (medium confidence) when parent has URLs
+    if has_url:
+        for key, value in obj.items():
+            if isinstance(value, dict):
+                for child_key, child_value in value.items():
+                    method = _match_auth_key(child_key)
+                    if method:
+                        val_str = str(child_value) if not isinstance(child_value, str) else child_value
+                        hints.append(AuthHint(
+                            method=method,
+                            confidence="medium",
+                            evidence_key=child_key,
+                            evidence_value=_redact_value(val_str),
+                            source=source_origin,
+                        ))
+
+    # Also check if this dict has auth keys and a child dict contains URLs (medium confidence)
+    auth_keys_here = {}
+    for key, value in obj.items():
+        method = _match_auth_key(key)
+        if method:
+            val_str = str(value) if not isinstance(value, str) else value
+            auth_keys_here[key] = (method, val_str)
+
+    if auth_keys_here:
+        for key, value in obj.items():
+            if isinstance(value, dict):
+                child_has_url = False
+                for v in value.values():
+                    if isinstance(v, str) and URL_RE.search(v):
+                        child_has_url = True
+                        break
+                if child_has_url:
+                    for auth_key, (method, val_str) in auth_keys_here.items():
+                        # Avoid duplicating hints already added as "high"
+                        if not any(h.evidence_key == auth_key and h.confidence == "high" for h in hints):
+                            hints.append(AuthHint(
+                                method=method,
+                                confidence="medium",
+                                evidence_key=auth_key,
+                                evidence_value=_redact_value(val_str),
+                                source=source_origin,
+                            ))
+
+    # Recurse into all children
+    for value in obj.values():
+        if isinstance(value, (dict, list)):
+            hints.extend(find_auth_context(value, source_origin))
+
+    return hints
+
+
+def run_static_auth_analysis(sources: list[ConfigSource]) -> dict[str, AuthInfo]:
+    """Run static auth analysis on all config sources, return dict keyed by URL."""
+    auth_map: dict[str, AuthInfo] = {}
+
+    # Collect all unique URLs first
+    for src in sources:
+        for url in src.urls_found:
+            if url not in auth_map:
+                auth_map[url] = AuthInfo(url=url)
+
+    # Find auth hints from each source's parsed JSON
+    for src in sources:
+        if src.json_payload is None:
+            continue
+        hints = find_auth_context(src.json_payload, src.origin)
+        if not hints:
+            continue
+
+        # Associate hints with URLs found in the same source
+        for url in src.urls_found:
+            if url in auth_map:
+                auth_map[url].static_hints.extend(hints)
+
+    return auth_map
+
+
+# ---------------------------------------------------------------------------
+# HTTP probing
+# ---------------------------------------------------------------------------
+
+def _parse_www_authenticate(header: str) -> str:
+    """Extract the auth scheme from a WWW-Authenticate header value."""
+    scheme = header.strip().split()[0].lower() if header else ""
+    mapping = {"basic": "basic", "bearer": "bearer", "negotiate": "negotiate", "ntlm": "negotiate"}
+    return mapping.get(scheme, scheme or "unknown")
+
+
+def _host_root_url(url: str) -> str | None:
+    """Return scheme://host[:port]/ if the URL has a path beyond /, else None."""
+    parsed = urlparse(url)
+    if parsed.path and parsed.path.rstrip("/"):
+        root = f"{parsed.scheme}://{parsed.netloc}/"
+        return root
+    return None
+
+
+async def _do_probe_request(
+    session: aiohttp.ClientSession,
+    url: str,
+    timeout: float,
+) -> tuple[int, str | None, str]:
+    """Make a HEAD (or GET fallback) request. Return (status_code, www_authenticate, location)."""
+    async with session.head(url, timeout=aiohttp.ClientTimeout(total=timeout),
+                            allow_redirects=False) as resp:
+        status = resp.status
+        if status == 405:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout),
+                                   allow_redirects=False) as resp2:
+                return (resp2.status,
+                        resp2.headers.get("WWW-Authenticate"),
+                        resp2.headers.get("Location", ""))
+        return status, resp.headers.get("WWW-Authenticate"), resp.headers.get("Location", "")
+
+
+def _classify_probe(status: int, www_auth: str | None, location: str = "") -> str:
+    """Classify a probe response into a detected auth method string."""
+    if status == 401:
+        return _parse_www_authenticate(www_auth) if www_auth else "unknown"
+    if status == 403:
+        return "forbidden"
+    if 200 <= status < 300:
+        return "none"
+    if 300 <= status < 400:
+        if any(kw in location.lower() for kw in ("oauth", "authorize", "login", "auth")):
+            return "oauth"
+        return "redirect"
+    if status == 400:
+        return "bad_request"
+    if status == 404:
+        return "not_found"
+    if status == 407:
+        return "proxy_auth"
+    if 500 <= status < 600:
+        return "server_error"
+    return "unknown"
+
+
+async def _probe_single(
+    session: aiohttp.ClientSession,
+    url: str,
+    semaphore: asyncio.Semaphore,
+    timeout: float,
+) -> ProbeResult:
+    """Probe a single URL for auth requirements."""
+    async with semaphore:
+        try:
+            status, www_auth, location = await _do_probe_request(session, url, timeout)
+            method = _classify_probe(status, www_auth, location)
+
+            # On 400/403/404, the specific path may not work or may block
+            # unauthenticated requests — the host root can still reveal
+            # the service's auth requirements more clearly
+            if status in (400, 403, 404):
+                root = _host_root_url(url)
+                if root:
+                    try:
+                        root_status, root_www_auth, root_location = await _do_probe_request(session, root, timeout)
+                        root_method = _classify_probe(root_status, root_www_auth, root_location)
+                        # Use root result if it reveals auth info
+                        if root_method not in ("bad_request", "forbidden", "not_found", "server_error", "unknown"):
+                            return ProbeResult(
+                                url=url,
+                                status_code=root_status,
+                                www_authenticate=root_www_auth,
+                                detected_method=root_method,
+                            )
+                    except Exception:
+                        pass  # root fallback failed, keep original result
+
+            return ProbeResult(
+                url=url,
+                status_code=status,
+                www_authenticate=www_auth,
+                detected_method=method,
+            )
+        except Exception as e:
+            return ProbeResult(
+                url=url,
+                status_code=None,
+                www_authenticate=None,
+                detected_method=None,
+                error=str(e),
+            )
+
+
+async def probe_urls(
+    urls: list[str],
+    timeout: float = 5.0,
+    max_concurrent: int = 10,
+) -> list[ProbeResult]:
+    """Probe a list of URLs for authentication requirements."""
+    unique_urls = list(dict.fromkeys(urls))  # deduplicate, preserve order
+    semaphore = asyncio.Semaphore(max_concurrent)
+    async with aiohttp.ClientSession(
+        headers={"User-Agent": "ConfigExtractor/1.0"},
+    ) as session:
+        tasks = [_probe_single(session, url, semaphore, timeout) for url in unique_urls]
+        return await asyncio.gather(*tasks)
+
+
+def merge_probe_results(auth_map: dict[str, AuthInfo], probes: list[ProbeResult]) -> None:
+    """Merge probe results into the auth map."""
+    for probe in probes:
+        if probe.url in auth_map:
+            auth_map[probe.url].probe_result = probe
+
+
+def reconcile_auth(auth_map: dict[str, AuthInfo]) -> None:
+    """Set best_guess on each AuthInfo by reconciling static hints and probe results."""
+    for info in auth_map.values():
+        probe = info.probe_result
+        high_hints = [h for h in info.static_hints if h.confidence == "high"]
+        any_hints = [h for h in info.static_hints if h.confidence in ("medium", "low")]
+
+        # Priority 1: Probe WWW-Authenticate header (most authoritative)
+        if probe and probe.www_authenticate:
+            info.best_guess = _parse_www_authenticate(probe.www_authenticate)
+        # Priority 2: High-confidence static hint
+        elif high_hints:
+            info.best_guess = high_hints[0].method
+        # Priority 3: Probe returned 200 — no auth needed
+        elif probe and probe.status_code and 200 <= probe.status_code < 300:
+            info.best_guess = "none"
+        # Priority 4: Probe detected a method (redirect to oauth, etc.)
+        elif probe and probe.detected_method and probe.detected_method not in ("unknown", "forbidden", None):
+            info.best_guess = probe.detected_method
+        # Priority 5: Medium/low confidence static hint
+        elif any_hints:
+            info.best_guess = any_hints[0].method
+        # Priority 6: Probe says forbidden (auth required but method unclear)
+        elif probe and probe.detected_method == "forbidden":
+            info.best_guess = "unknown (forbidden)"
+        # else: stays "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +624,10 @@ async def crawl(
 # Reporting
 # ---------------------------------------------------------------------------
 
-def print_results(sources: list[ConfigSource]) -> None:
+def print_results(
+    sources: list[ConfigSource],
+    auth_map: dict[str, AuthInfo] | None = None,
+) -> None:
     if not sources:
         print("\nNo JSON configurations with URLs were found.")
         return
@@ -324,10 +656,43 @@ def print_results(sources: list[ConfigSource]) -> None:
         print(f"\nUnique hosts ({len(sorted_hosts)}):")
         for h in sorted_hosts:
             print(f"    {h}")
-    print(f"{'=' * 70}\n")
+    print(f"{'=' * 70}")
+
+    # Auth analysis section
+    if auth_map:
+        print(f"\n{'=' * 70}")
+        print("Authentication Analysis")
+        print(f"{'=' * 70}")
+        for url in sorted(auth_map):
+            info = auth_map[url]
+            print(f"\n  {url}")
+            if info.static_hints:
+                # Show the highest-confidence hint
+                best = sorted(info.static_hints,
+                              key=lambda h: {"high": 0, "medium": 1, "low": 2}.get(h.confidence, 3))[0]
+                print(f"    Static:  {best.method} ({best.confidence}, key: \"{best.evidence_key}\")")
+            else:
+                print("    Static:  (none)")
+            if info.probe_result:
+                probe = info.probe_result
+                if probe.error:
+                    print(f"    Probe:   error — {probe.error}")
+                elif probe.www_authenticate:
+                    print(f"    Probe:   {probe.status_code} — WWW-Authenticate: {probe.www_authenticate}")
+                else:
+                    label = probe.detected_method or "unknown"
+                    print(f"    Probe:   {probe.status_code} — {label}")
+            print(f"    Verdict: {info.best_guess}")
+        print(f"\n{'=' * 70}")
+
+    print()
 
 
-def write_results(sources: list[ConfigSource], path: str) -> None:
+def write_results(
+    sources: list[ConfigSource],
+    path: str,
+    auth_map: dict[str, AuthInfo] | None = None,
+) -> None:
     all_urls: set[str] = set()
     entries = []
     for src in sources:
@@ -344,10 +709,35 @@ def write_results(sources: list[ConfigSource], path: str) -> None:
         if host:
             hosts.add(host)
 
-    output = {
+    output: dict = {
         "sources": entries,
         "unique_hosts": sorted(hosts),
     }
+
+    if auth_map:
+        auth_section: dict = {}
+        for url, info in sorted(auth_map.items()):
+            entry: dict = {"best_guess": info.best_guess}
+            if info.static_hints:
+                entry["static_hints"] = [
+                    {
+                        "method": h.method,
+                        "confidence": h.confidence,
+                        "evidence_key": h.evidence_key,
+                    }
+                    for h in info.static_hints
+                ]
+            if info.probe_result:
+                p = info.probe_result
+                entry["probe"] = {
+                    "status_code": p.status_code,
+                    "www_authenticate": p.www_authenticate,
+                    "detected_method": p.detected_method,
+                    "error": p.error,
+                }
+            auth_section[url] = entry
+        output["auth"] = auth_section
+
     with open(path, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
     print(f"Results written to {path}")
@@ -375,6 +765,18 @@ def main() -> None:
         "--headed", action="store_true",
         help="Run browser in headed mode (visible window)",
     )
+    parser.add_argument(
+        "--probe", action="store_true",
+        help="Probe discovered URLs for authentication requirements",
+    )
+    parser.add_argument(
+        "--probe-timeout", type=int, default=5,
+        help="Per-URL probe timeout in seconds (default: 5)",
+    )
+    parser.add_argument(
+        "--probe-concurrency", type=int, default=10,
+        help="Max concurrent probe requests (default: 10)",
+    )
     args = parser.parse_args()
 
     sources = asyncio.run(crawl(
@@ -384,10 +786,28 @@ def main() -> None:
         headed=args.headed,
     ))
 
-    print_results(sources)
+    # Auth analysis
+    auth_map = run_static_auth_analysis(sources)
+
+    if args.probe:
+        all_urls = []
+        for src in sources:
+            all_urls.extend(src.urls_found)
+        unique_urls = list(dict.fromkeys(all_urls))
+        print(f"Probing {len(unique_urls)} URLs for authentication methods...")
+        probes = asyncio.run(probe_urls(
+            unique_urls,
+            timeout=float(args.probe_timeout),
+            max_concurrent=args.probe_concurrency,
+        ))
+        merge_probe_results(auth_map, probes)
+
+    reconcile_auth(auth_map)
+
+    print_results(sources, auth_map)
 
     if args.output:
-        write_results(sources, args.output)
+        write_results(sources, args.output, auth_map)
 
 
 if __name__ == "__main__":
